@@ -18,6 +18,8 @@ use util::ResultExt;
 pub struct DiffPatch {
     pub files: Vec<DiffPatchFile>,
     pub fallback: Option<Entity<Markdown>>,
+    pub added_lines: u32,
+    pub removed_lines: u32,
 }
 
 #[derive(Debug)]
@@ -52,11 +54,15 @@ impl DiffPatch {
             return Self {
                 files,
                 fallback: None,
+                added_lines: 0,
+                removed_lines: 0,
             };
         }
 
         match Self::parse(source) {
             Ok(parsed) => {
+                let mut added_lines = 0u32;
+                let mut removed_lines = 0u32;
                 for (change_index, file) in parsed {
                     let path = file.new_path.or(file.old_path).unwrap_or_default();
                     if let Some(render) = files.get_mut(change_index) {
@@ -64,6 +70,8 @@ impl DiffPatch {
                             .hunks
                             .into_iter()
                             .map(|hunk| {
+                                added_lines = added_lines.saturating_add(hunk.added_lines);
+                                removed_lines = removed_lines.saturating_add(hunk.removed_lines);
                                 DiffPatchHunk::new(hunk, &path, language_registry.clone(), cx)
                             })
                             .collect();
@@ -72,6 +80,8 @@ impl DiffPatch {
                 Self {
                     files,
                     fallback: None,
+                    added_lines,
+                    removed_lines,
                 }
             }
             Err(error) => {
@@ -86,9 +96,15 @@ impl DiffPatch {
                         language_registry,
                         cx,
                     )),
+                    added_lines: 0,
+                    removed_lines: 0,
                 }
             }
         }
+    }
+
+    pub fn changed_row_counts(&self) -> (u32, u32) {
+        (self.added_lines, self.removed_lines)
     }
 
     fn parse(source: &acp_v2::Diff) -> Result<Vec<(usize, patch::PatchFile)>> {
@@ -294,7 +310,7 @@ impl Diff {
             let multibuffer = multibuffer.clone();
             let path = path.clone();
             let buffer = new_buffer.clone();
-            async move |_, cx| {
+            async move |this, cx| {
                 let language = language_registry
                     .load_language_for_file_path(Path::new(&path))
                     .await
@@ -332,8 +348,15 @@ impl Diff {
                         excerpt_context_lines(cx),
                         cx,
                     );
-                    multibuffer.add_diff(diff, cx);
+                    multibuffer.add_diff(diff.clone(), cx);
                 });
+
+                this.update(cx, |this, cx| {
+                    if let Self::Finalized(finalized) = this {
+                        finalized.diff = Some(diff);
+                    }
+                    cx.notify();
+                })?;
 
                 anyhow::Ok(())
             }
@@ -344,6 +367,7 @@ impl Diff {
             path,
             base_text,
             new_buffer,
+            diff: None,
             _update_diff: task,
         })
     }
@@ -451,6 +475,14 @@ impl Diff {
 
     pub fn has_revealed_range(&self, cx: &App) -> bool {
         !self.multibuffer().read(cx).is_empty()
+    }
+
+    pub fn changed_row_counts(&self, cx: &App) -> Option<(u32, u32)> {
+        let diff = match self {
+            Self::Pending(PendingDiff { diff, .. }) => Some(diff),
+            Self::Finalized(FinalizedDiff { diff, .. }) => diff.as_ref(),
+        }?;
+        Some(diff.read(cx).changed_row_counts())
     }
 
     pub fn needs_update(&self, old_text: &str, new_text: &str, cx: &App) -> bool {
@@ -568,6 +600,9 @@ impl PendingDiff {
                     );
                     multibuffer.add_diff(buffer_diff.clone(), cx);
                 });
+                if let Diff::Finalized(finalized) = this {
+                    finalized.diff = Some(buffer_diff);
+                }
 
                 cx.notify();
             })
@@ -578,6 +613,7 @@ impl PendingDiff {
             base_text: self.base_text.clone(),
             multibuffer: self.multibuffer.clone(),
             new_buffer: self.new_buffer.clone(),
+            diff: Some(self.diff.clone()),
             _update_diff: update_diff,
         }
     }
@@ -642,6 +678,7 @@ pub struct FinalizedDiff {
     base_text: Arc<str>,
     new_buffer: Entity<Buffer>,
     multibuffer: Entity<MultiBuffer>,
+    diff: Option<Entity<BufferDiff>>,
     _update_diff: Task<Result<()>>,
 }
 
@@ -934,11 +971,41 @@ mod tests {
 
     #[gpui::test]
     async fn test_pending_diff(cx: &mut TestAppContext) {
-        let buffer = cx.new(|cx| Buffer::local("hello!", cx));
-        let _diff = cx.new(|cx| Diff::new(buffer.clone(), cx));
+        let buffer = cx.new(|cx| Buffer::local("hello!\nworld\n", cx));
+        let diff = cx.new(|cx| Diff::new(buffer.clone(), cx));
         buffer.update(cx, |buffer, cx| {
-            buffer.set_text("HELLO!", cx);
+            buffer.set_text("HELLO!\nworld\nnew line\n", cx);
         });
         cx.run_until_parked();
+
+        diff.read_with(cx, |diff, cx| {
+            assert_eq!(diff.changed_row_counts(cx), Some((2, 1)));
+        });
+
+        diff.update(cx, |diff, cx| {
+            diff.finalize(cx);
+            assert_eq!(diff.changed_row_counts(cx), Some((2, 1)));
+        });
+        cx.run_until_parked();
+
+        diff.read_with(cx, |diff, cx| {
+            assert_eq!(diff.changed_row_counts(cx), Some((2, 1)));
+        });
+
+        let restored = cx.new(|cx| {
+            let languages = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+            Diff::finalized(
+                "test.rs".into(),
+                Some("line1\nline2\n".into()),
+                "line1\nline2_mod\nline3\n".into(),
+                languages,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        restored.read_with(cx, |diff, cx| {
+            assert_eq!(diff.changed_row_counts(cx), Some((2, 1)));
+        });
     }
 }

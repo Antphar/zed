@@ -384,6 +384,7 @@ impl EntryViewState {
 
                 for diff in diffs {
                     views.entry(diff.entity_id()).or_insert_with(|| {
+                        cx.observe(&diff, |_, _, cx| cx.notify()).detach();
                         let editor = create_editor_diff(diff.clone(), window, cx);
                         cx.subscribe(&editor, {
                             let diff = diff.clone();
